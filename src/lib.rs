@@ -36,9 +36,9 @@ use windows_sys::Win32::{
     Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE},
     System::{
         Memory::{
-            CreateFileMappingW, MapViewOfFile3, VirtualAlloc2, VirtualFree,
+            CreateFileMappingW, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
             MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
-            MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY,
+            MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         },
         SystemInformation::{GetSystemInfo, SYSTEM_INFO},
     },
@@ -73,7 +73,7 @@ impl SystemError {
     }
 }
 
-pub fn page_size() -> u32 {
+pub fn page_size_u32() -> u32 {
     static PAGE_SIZE: AtomicU32 = AtomicU32::new(0);
 
     let mut size = PAGE_SIZE.load(Ordering::Relaxed);
@@ -99,6 +99,16 @@ pub fn page_size() -> u32 {
     size
 }
 
+pub fn page_size() -> usize {
+    page_size_u32() as usize
+}
+
+pub fn round_up_to_page_size(size: usize) -> usize {
+    let page_size = page_size();
+
+    (size.saturating_add(page_size - 1) / page_size) * page_size
+}
+
 lazy_static! {
     static ref NULL_MAP: HANDLE = unsafe {
         CreateFileMappingW(
@@ -106,17 +116,20 @@ lazy_static! {
             null(),
             PAGE_READONLY,
             0,
-            page_size(),
+            page_size_u32(),
             null(),
         )
     };
 }
 
-pub fn reserve(page_count: usize) -> Result<NonNull<()>, SystemError> {
-    let page_size = page_size() as usize;
-    let alloc_size = page_size.saturating_mul(page_count);
+// TODO: Implement cleanup on failure.
 
-    // Validate the `page_count`
+pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
+    let page_size = page_size();
+    let page_count = alloc_size / page_size;
+
+    // Validate sizes.
+    assert_eq!(alloc_size % page_size, 0);
     assert!(
         alloc_size < isize::MAX as usize,
         "Reservation overflows isize::MAX",
@@ -125,7 +138,7 @@ pub fn reserve(page_count: usize) -> Result<NonNull<()>, SystemError> {
     // Reserve a contiguous block of pages.
     let Some(base_addr) = NonNull::new(unsafe {
 		VirtualAlloc2(
-			/* Process */ 0,
+			/* process */ INVALID_HANDLE_VALUE,
 			null(),
 			alloc_size,
 			MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
@@ -160,11 +173,11 @@ pub fn reserve(page_count: usize) -> Result<NonNull<()>, SystemError> {
         // ...and map it!
         let mapped_addr = unsafe {
             MapViewOfFile3(
-                null_map,
-                INVALID_HANDLE_VALUE,
-                page_addr.cast(),
-                0,
-                page_size,
+                /* map */ null_map,
+                /* process */ INVALID_HANDLE_VALUE,
+                /* base address */ page_addr.cast(),
+                /* size high */ 0,
+                /* size low */ page_size,
                 MEM_REPLACE_PLACEHOLDER,
                 PAGE_READONLY,
                 null_mut(),
@@ -181,12 +194,57 @@ pub fn reserve(page_count: usize) -> Result<NonNull<()>, SystemError> {
 }
 
 pub unsafe fn unreserve(addr: NonNull<()>) {
-    // TODO: Error handling
-    let _ignored_error = VirtualFree(addr.as_ptr().cast(), 0, MEM_RELEASE);
+    debug_assert_eq!(addr.as_ptr() as usize % page_size(), 0);
+
+    let error = VirtualFree(addr.as_ptr().cast(), 0, MEM_RELEASE);
+    debug_assert_eq!(error, 0);
 }
 
-pub unsafe fn commit(_addr: NonNull<()>, _size: usize) -> Result<(), SystemError> {
-    todo!();
+pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> {
+    let addr = addr.as_ptr().cast::<u8>();
+    let page_size = page_size();
+    let page_count = size / page_size;
+
+    // Validate sizes
+    assert!(size < isize::MAX as usize);
+    assert_eq!(addr as usize % page_size, 0);
+    assert_eq!(size % page_size, 0);
+
+    // For every placeholder in the range...
+    for i in 0..page_count {
+        let addr = unsafe { addr.add(i * page_size) };
+
+        // Remove its mapping...
+        if unsafe {
+            UnmapViewOfFile2(
+                INVALID_HANDLE_VALUE,
+                addr as isize,
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        } != 1
+        {
+            return Err(SystemError::from_errno());
+        }
+
+        // ...and commit the placeholder's memory.
+        if unsafe {
+            VirtualAlloc2(
+                0,
+                addr.cast(),
+                page_size,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                null_mut(),
+                0,
+            )
+        }
+        .is_null()
+        {
+            return Err(SystemError::from_errno());
+        }
+    }
+
+    Ok(())
 }
 
 pub unsafe fn uncommit(_addr: NonNull<()>, _size: usize) {
@@ -202,43 +260,39 @@ mod tests {
 
     #[test]
     fn reserve_one_page() {
-        reserve(1).unwrap();
+        reserve(page_size()).unwrap();
     }
 
     #[test]
     fn reserve_many_pages() {
-        reserve(1000).unwrap();
+        reserve(page_size() * 1000).unwrap();
     }
 
     #[test]
     fn reads_zero() {
-        let page_count = 1000;
-        let page_base = reserve(page_count).unwrap();
-        let page_slice = unsafe {
-            std::slice::from_raw_parts(
-                page_base.as_ptr().cast::<u8>(),
-                page_size() as usize * page_count,
-            )
-        };
+        let size = 1000 * page_size();
+        let page_base = reserve(size).unwrap();
+        let page_slice =
+            unsafe { std::slice::from_raw_parts(page_base.as_ptr().cast::<u8>(), size) };
 
         assert!(page_slice.iter().all(|&v| v == 0));
     }
 
     #[test]
     fn no_commit_on_reserve() {
-        let page_count = 10usize.pow(8) / page_size() as usize;
+        let alloc_size = round_up_to_page_size(10usize.pow(8));
 
-        println!("Note: the page size is {}", page_size());
+        println!("The page size is {}", page_size());
 
         // Reserve one page before checking `PagefileUsage` to ensure that the null page is created.
-        reserve(page_count).unwrap();
+        reserve(alloc_size).unwrap();
 
         // Reserve a bunch of memory to ensure that it doesn't consume commit charges.
         let mut last_usage = get_stats().PeakPagefileUsage as isize;
         for _ in 0..10 {
             // This will almost certainly exhaust the commit charges available to the application but
             // should not exhaust the virtual address space.
-            reserve(page_count).unwrap();
+            reserve(alloc_size).unwrap();
 
             let curr_usage = get_stats().PeakPagefileUsage as isize;
             let usage_delta = curr_usage - last_usage;
@@ -246,6 +300,27 @@ mod tests {
 
             assert_eq!(usage_delta, 0);
         }
+    }
+
+    #[test]
+    fn can_unreserve() {
+        let base = reserve(page_size()).unwrap();
+        unsafe { unreserve(base) };
+    }
+
+    #[test]
+    fn commit_and_write() {
+        // Allocate and check
+        let base = reserve(page_size() * 2).unwrap();
+        assert_eq!(unsafe { *base.cast::<u8>().as_ptr() }, 0);
+
+        // Commit and check
+        unsafe { commit(base, page_size()) }.unwrap();
+        unsafe { *base.cast::<u8>().as_ptr() = 4 };
+        assert_eq!(unsafe { *base.cast::<u8>().as_ptr() }, 0);
+
+        // Unreserve
+        unsafe { unreserve(base) };
     }
 
     fn get_stats() -> PROCESS_MEMORY_COUNTERS {
