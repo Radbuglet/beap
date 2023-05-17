@@ -158,23 +158,23 @@ pub fn reserve(page_count: usize) -> Result<NonNull<()>, SystemError> {
         }
 
         // ...and map it!
-        //         let mapped_addr = unsafe {
-        //             MapViewOfFile3(
-        //                 null_map,
-        //                 INVALID_HANDLE_VALUE,
-        //                 page_addr.cast(),
-        //                 0,
-        //                 page_size,
-        //                 MEM_REPLACE_PLACEHOLDER,
-        //                 PAGE_READONLY,
-        //                 null_mut(),
-        //                 0,
-        //             )
-        //         };
-        //
-        //         if mapped_addr == 0 {
-        //             return Err(SystemError::from_errno());
-        //         }
+        let mapped_addr = unsafe {
+            MapViewOfFile3(
+                null_map,
+                INVALID_HANDLE_VALUE,
+                page_addr.cast(),
+                0,
+                page_size,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READONLY,
+                null_mut(),
+                0,
+            )
+        };
+
+        if mapped_addr == 0 {
+            return Err(SystemError::from_errno());
+        }
     }
 
     Ok(base_addr.cast())
@@ -185,20 +185,20 @@ pub unsafe fn unreserve(addr: NonNull<()>) {
     let _ignored_error = VirtualFree(addr.as_ptr().cast(), 0, MEM_RELEASE);
 }
 
-pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> {
+pub unsafe fn commit(_addr: NonNull<()>, _size: usize) -> Result<(), SystemError> {
     todo!();
 }
 
-pub unsafe fn uncommit(addr: NonNull<()>, size: usize) {
+pub unsafe fn uncommit(_addr: NonNull<()>, _size: usize) {
     todo!();
 }
 
 #[cfg(test)]
 mod tests {
-
-    use windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS;
-
     use super::*;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
 
     #[test]
     fn reserve_one_page() {
@@ -211,20 +211,36 @@ mod tests {
     }
 
     #[test]
+    fn reads_zero() {
+        let page_count = 1000;
+        let page_base = reserve(page_count).unwrap();
+        let page_slice = unsafe {
+            std::slice::from_raw_parts(
+                page_base.as_ptr().cast::<u8>(),
+                page_size() as usize * page_count,
+            )
+        };
+
+        assert!(page_slice.iter().all(|&v| v == 0));
+    }
+
+    #[test]
     fn no_commit_on_reserve() {
         let page_count = 10usize.pow(8) / page_size() as usize;
+
+        println!("Note: the page size is {}", page_size());
 
         // Reserve one page before checking `PagefileUsage` to ensure that the null page is created.
         reserve(page_count).unwrap();
 
         // Reserve a bunch of memory to ensure that it doesn't consume commit charges.
-        let mut last_usage = get_stats().PagefileUsage as isize;
+        let mut last_usage = get_stats().PeakPagefileUsage as isize;
         for _ in 0..10 {
             // This will almost certainly exhaust the commit charges available to the application but
             // should not exhaust the virtual address space.
             reserve(page_count).unwrap();
 
-            let curr_usage = get_stats().PagefileUsage as isize;
+            let curr_usage = get_stats().PeakPagefileUsage as isize;
             let usage_delta = curr_usage - last_usage;
             last_usage = curr_usage;
 
@@ -233,8 +249,6 @@ mod tests {
     }
 
     fn get_stats() -> PROCESS_MEMORY_COUNTERS {
-        use windows_sys::Win32::System::ProcessStatus::GetProcessMemoryInfo;
-
         unsafe {
             let mut counters = MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
             GetProcessMemoryInfo(
