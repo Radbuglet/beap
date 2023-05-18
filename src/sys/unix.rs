@@ -14,8 +14,11 @@ impl Error for SystemError {}
 
 impl fmt::Display for SystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = unsafe { CStr::from_ptr(libc::strerror(self.0)) };
-        write!(f, "System error {:?}: {str:?}", self.0)
+        let str = unsafe {
+            // Safety: this string will stay alive on this thread until the next call to `strerror`.
+            CStr::from_ptr(libc::strerror(self.0))
+        };
+        write!(f, "system error {:?}: {str:?}", self.0)
     }
 }
 

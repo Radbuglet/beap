@@ -1,14 +1,16 @@
-// win32 quick reference:
-// https://stackoverflow.com/questions/39984710/virtual-memory-ring-buffer-on-windows
-// https://docs.rs/windows-sys/latest/windows_sys/index.html
-// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/
-// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc2
-// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-createfilemappingw
-// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3
-// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
+//! `win32` quick reference:
+//!
+//! - https://docs.rs/windows-sys/latest/windows_sys/index.html
+//! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/
+//! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc2
+//! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-createfilemappingw
+//! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3
+//! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
+//!
 
 use std::{
     error::Error,
+    ffi::CStr,
     fmt,
     mem::MaybeUninit,
     ptr::{null, null_mut, NonNull},
@@ -17,29 +19,46 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use windows_sys::Win32::{
-    Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE},
-    System::{
-        Memory::{
-            CreateFileMappingW, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
-            MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
-            MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+use windows_sys::{
+    core::PSTR,
+    Win32::{
+        Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::Debug::{
+                FormatMessageA, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
+                FORMAT_MESSAGE_IGNORE_INSERTS,
+            },
+            Memory::{
+                CreateFileMappingW, LocalFree, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2,
+                VirtualFree, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+                MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            },
+            SystemInformation::{GetSystemInfo, SYSTEM_INFO},
         },
-        SystemInformation::{GetSystemInfo, SYSTEM_INFO},
     },
 };
 
 use crate::page_size;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SystemError(u32);
 
 impl Error for SystemError {}
 
-impl fmt::Display for SystemError {
+impl fmt::Debug for SystemError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TODO: Print a string
-        write!(f, "System error {:?}", self.0)
+        f.debug_tuple("SystemError")
+            .field(&format!("{}", self))
+            .finish()
+    }
+}
+
+impl fmt::Display for SystemError {
+    #[rustfmt::skip]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+       write!(f, "system error {}: ", self.0)?;
+	   self.write_error(f)?;
+	   Ok(())
     }
 }
 
@@ -49,6 +68,39 @@ impl SystemError {
             // Safety: `GetLastError`'s internal errno is stored using TLS.
             GetLastError()
         })
+    }
+
+    fn write_error(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        unsafe {
+            // Acquire the error message from the system
+            let mut out_str = MaybeUninit::<PSTR>::uninit();
+            FormatMessageA(
+                /* flags*/
+                FORMAT_MESSAGE_ALLOCATE_BUFFER
+                    | FORMAT_MESSAGE_FROM_SYSTEM
+                    | FORMAT_MESSAGE_IGNORE_INSERTS,
+                /* source */ null(),
+                /* message id */ self.0,
+                /* language ID (language neutral -> ... -> locale -> ... -> US English) */ 0,
+                /* str pointer out */
+                // N.B. Usually, this is an `LPTSTR`. However, when `FORMAT_MESSAGE_ALLOCATE_BUFFER`
+                // is specified, this actually takes on the type `*mut LPTSTR`. We can't express
+                // this in the type system so weird cast it is!
+                out_str.as_mut_ptr().cast(),
+                /* min buffer size (given FORMAT_MESSAGE_ALLOCATE_BUFFER) */ 0,
+                /* formatting arguments */ null(),
+            );
+
+            let out_str = out_str.assume_init();
+
+            // Print it out
+            f.write_str(&CStr::from_ptr(out_str.cast()).to_string_lossy())?;
+
+            // Deallocate the temporary buffer
+            LocalFree(out_str as isize);
+
+            Ok(())
+        }
     }
 }
 
@@ -81,12 +133,12 @@ pub fn page_size_u32() -> u32 {
 lazy_static! {
     static ref NULL_MAP: HANDLE = unsafe {
         CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            null(),
-            PAGE_READONLY,
-            0,
-            page_size_u32(),
-            null(),
+            /* file */ INVALID_HANDLE_VALUE,
+            /* attribs */ null(),
+            /* protection */ PAGE_READONLY,
+            /* size high */ 0,
+            /* size low */ page_size_u32(),
+            /* unique name*/ null(),
         )
     };
 }
@@ -118,7 +170,9 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
         return Err(SystemError::from_errno());
     };
 
-    // Map each of the pages to the null map.
+    // Map each of the pages to the shared null map. Because we're mapping views rather than creating
+    // views or committing memory, we only pay for one page worth of commit charge for all our
+    // reservations.
     let base_addr = base_addr.cast::<u8>();
     let null_map = *NULL_MAP;
 
@@ -165,6 +219,8 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
 pub unsafe fn unreserve(addr: NonNull<()>, _len: usize) {
     assert_eq!(addr.as_ptr() as usize % page_size(), 0);
 
+    // This call frees mapped and committed memory indiscriminately, regardless of the whether they
+    // belong to the same placeholder.
     let error = VirtualFree(addr.as_ptr().cast(), 0, MEM_RELEASE);
     assert_eq!(error, 0);
 }
@@ -198,7 +254,7 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
         // ...and commit the placeholder's memory.
         if unsafe {
             VirtualAlloc2(
-                0,
+                INVALID_HANDLE_VALUE,
                 addr.cast(),
                 page_size,
                 MEM_REPLACE_PLACEHOLDER,
