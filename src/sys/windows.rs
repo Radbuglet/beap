@@ -31,9 +31,8 @@ use windows_sys::{
             },
             Memory::{
                 CreateFileMappingW, LocalFree, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2,
-                VirtualFree, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
-                MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
-                PAGE_READONLY, PAGE_READWRITE,
+                VirtualFree, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+                MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
             },
             SystemInformation::{GetSystemInfo, SYSTEM_INFO},
         },
@@ -101,6 +100,10 @@ impl SystemError {
             GetLastError()
         })
     }
+
+    fn raise(&self) -> ! {
+        panic!("{}", self);
+    }
 }
 
 pub fn page_size_u32() -> u32 {
@@ -133,7 +136,7 @@ lazy_static! {
     static ref NULL_MAP: HANDLE = unsafe {
         CreateFileMappingW(
             /* file */ INVALID_HANDLE_VALUE,
-            /* attribs */ null(),
+            /* attributes */ null(),
             /* protection */ PAGE_READONLY,
             /* size high */ 0,
             /* size low */ page_size_u32(),
@@ -172,17 +175,17 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
     // Map each of the pages to the shared null map. Because we're mapping views rather than creating
     // views or committing memory, we only pay for one page worth of commit charge for all our
     // reservations.
-    let base_addr = base_addr.cast::<u8>();
+    let addr = base_addr.cast::<u8>();
     let null_map = *NULL_MAP;
 
     for i in 0..page_count {
-        let page_addr = unsafe { base_addr.as_ptr().add(i * page_size) };
+        let addr = unsafe { addr.as_ptr().add(i * page_size) };
 
         // Isolate a placeholder for the page if it isn't already of that size.
         if i != page_count - 1 {
             if unsafe {
                 VirtualFree(
-                    /* base address */ page_addr.cast(),
+                    /* base address */ addr.cast(),
                     /* size */ page_size,
                     /* flags */ MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
                 )
@@ -197,7 +200,7 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
             MapViewOfFile3(
                 /* map */ null_map,
                 /* process */ INVALID_HANDLE_VALUE,
-                /* base address */ page_addr.cast(),
+                /* base address */ addr.cast(),
                 /* size high */ 0,
                 /* size low */ page_size,
                 /* flags */ MEM_REPLACE_PLACEHOLDER,
@@ -213,7 +216,7 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
         }
     }
 
-    Ok(base_addr.cast())
+    Ok(addr.cast())
 }
 
 pub unsafe fn unreserve(addr: NonNull<()>, _len: usize) {
@@ -222,7 +225,7 @@ pub unsafe fn unreserve(addr: NonNull<()>, _len: usize) {
     // This call frees mapped and committed memory indiscriminately, regardless of the whether they
     // belong to the same placeholder.
     let error = VirtualFree(addr.as_ptr().cast(), 0, MEM_RELEASE);
-    assert_eq!(error, 0);
+    assert_eq!(error, 0, "{}", SystemError::from_errno());
 }
 
 pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> {
@@ -252,14 +255,15 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
         }
 
         // ...and commit the placeholder's memory.
+        // FIXME: This just doesn't work.
         if unsafe {
             VirtualAlloc2(
-                INVALID_HANDLE_VALUE,
-                addr.cast(),
-                page_size,
-                MEM_COMMIT,
-                PAGE_READWRITE,
-                null_mut(),
+                /* process */ INVALID_HANDLE_VALUE,
+                /* base address */ null(),
+                /* size */ page_size,
+                /* flags */ MEM_REPLACE_PLACEHOLDER,
+                /* protection */ PAGE_READWRITE,
+                /* ExtendedParameters + Count */ null_mut(),
                 0,
             )
         }
@@ -272,6 +276,50 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
     Ok(())
 }
 
-pub unsafe fn uncommit(_addr: NonNull<()>, _size: usize) {
-    todo!();
+pub unsafe fn uncommit(addr: NonNull<()>, size: usize) {
+    let addr = addr.as_ptr().cast::<u8>();
+    let page_size = page_size();
+    let page_count = size / page_size;
+    let null_map = *NULL_MAP;
+
+    // Validate sizes
+    assert!(size < isize::MAX as usize);
+    assert_eq!(addr as usize % page_size, 0);
+    assert_eq!(size % page_size, 0);
+
+    // For every placeholder in the range...
+    for i in 0..page_count {
+        let addr = unsafe { addr.add(i * page_size) };
+
+        // Decommit its memory...
+        if unsafe {
+            UnmapViewOfFile2(
+                /* process*/ INVALID_HANDLE_VALUE,
+                /* base address */ addr as isize,
+                /* flags */ MEM_PRESERVE_PLACEHOLDER,
+            )
+        } != 1
+        {
+            SystemError::from_errno().raise();
+        }
+
+        // ...and map the null map in its place.
+        if unsafe {
+            MapViewOfFile3(
+                /* map */ null_map,
+                /* process */ INVALID_HANDLE_VALUE,
+                /* base address */ addr.cast(),
+                /* size high */ 0,
+                /* size low */ page_size,
+                /* flags */ MEM_REPLACE_PLACEHOLDER,
+                /* protection */ PAGE_READONLY,
+                /* extra params */
+                null_mut(),
+                0,
+            )
+        } == 0
+        {
+            SystemError::from_errno().raise();
+        }
+    }
 }
