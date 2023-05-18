@@ -5,6 +5,7 @@
 //! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc2
 //! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-createfilemappingw
 //! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3
+//! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-unmapviewoffile2
 //! - https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
 //!
 
@@ -30,8 +31,9 @@ use windows_sys::{
             },
             Memory::{
                 CreateFileMappingW, LocalFree, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2,
-                VirtualFree, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-                MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+                VirtualFree, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+                MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                PAGE_READONLY, PAGE_READWRITE,
             },
             SystemInformation::{GetSystemInfo, SYSTEM_INFO},
         },
@@ -54,28 +56,12 @@ impl fmt::Debug for SystemError {
 }
 
 impl fmt::Display for SystemError {
-    #[rustfmt::skip]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-       write!(f, "system error {}: ", self.0)?;
-	   self.write_error(f)?;
-	   Ok(())
-    }
-}
-
-impl SystemError {
-    fn from_errno() -> Self {
-        Self(unsafe {
-            // Safety: `GetLastError`'s internal errno is stored using TLS.
-            GetLastError()
-        })
-    }
-
-    fn write_error(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         unsafe {
             // Acquire the error message from the system
             let mut out_str = MaybeUninit::<PSTR>::uninit();
             FormatMessageA(
-                /* flags*/
+                /* flags */
                 FORMAT_MESSAGE_ALLOCATE_BUFFER
                     | FORMAT_MESSAGE_FROM_SYSTEM
                     | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -94,13 +80,26 @@ impl SystemError {
             let out_str = out_str.assume_init();
 
             // Print it out
-            f.write_str(&CStr::from_ptr(out_str.cast()).to_string_lossy())?;
+            write!(
+                f,
+                "system error {}: {}",
+                self.0,
+                CStr::from_ptr(out_str.cast()).to_string_lossy()
+            )?;
 
             // Deallocate the temporary buffer
             LocalFree(out_str as isize);
-
-            Ok(())
         }
+        Ok(())
+    }
+}
+
+impl SystemError {
+    fn from_errno() -> Self {
+        Self(unsafe {
+            // Safety: `GetLastError`'s internal errno is stored using TLS.
+            GetLastError()
+        })
     }
 }
 
@@ -160,10 +159,10 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
     let Some(base_addr) = NonNull::new(unsafe {
 		VirtualAlloc2(
 			/* process */ INVALID_HANDLE_VALUE,
-			null(),
-			alloc_size,
-			MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-			PAGE_NOACCESS,
+			/* base address */ null(),
+			/* size */ alloc_size,
+			/* flags */ MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+			/* protection */ PAGE_NOACCESS,
 			/* ExtendedParameters + Count */ null_mut(), 0
 		)
 	}) else {
@@ -183,9 +182,9 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
         if i != page_count - 1 {
             if unsafe {
                 VirtualFree(
-                    page_addr.cast(),
-                    page_size,
-                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                    /* base address */ page_addr.cast(),
+                    /* size */ page_size,
+                    /* flags */ MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
                 )
             } == 0
             {
@@ -201,8 +200,9 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
                 /* base address */ page_addr.cast(),
                 /* size high */ 0,
                 /* size low */ page_size,
-                MEM_REPLACE_PLACEHOLDER,
-                PAGE_READONLY,
+                /* flags */ MEM_REPLACE_PLACEHOLDER,
+                /* protection */ PAGE_READONLY,
+                /* extra params */
                 null_mut(),
                 0,
             )
@@ -242,9 +242,9 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
         // Remove its mapping...
         if unsafe {
             UnmapViewOfFile2(
-                INVALID_HANDLE_VALUE,
-                addr as isize,
-                MEM_PRESERVE_PLACEHOLDER,
+                /* process*/ INVALID_HANDLE_VALUE,
+                /* base address */ addr as isize,
+                /* flags */ MEM_PRESERVE_PLACEHOLDER,
             )
         } != 1
         {
@@ -257,7 +257,7 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
                 INVALID_HANDLE_VALUE,
                 addr.cast(),
                 page_size,
-                MEM_REPLACE_PLACEHOLDER,
+                MEM_COMMIT,
                 PAGE_READWRITE,
                 null_mut(),
                 0,
