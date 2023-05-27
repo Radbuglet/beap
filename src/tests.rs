@@ -1,3 +1,5 @@
+use std::ptr::NonNull;
+
 use super::*;
 
 #[test]
@@ -51,22 +53,34 @@ fn can_unreserve() {
 
 #[test]
 fn commit_and_write() {
-    let reserve_size = page_size() * 2;
-    // Allocate and check
-    let base = reserve(reserve_size).unwrap();
-    assert_eq!(unsafe { *base.cast::<u8>().as_ptr() }, 0);
+    println!("The page size is {}", page_size());
 
-    // Commit and check
-    unsafe { commit(base, page_size()) }.unwrap();
-    unsafe { *base.cast::<u8>().as_ptr() = 4 };
-    assert_eq!(unsafe { *base.cast::<u8>().as_ptr() }, 4);
+    for page_count in [1, 2, 4] {
+        let reserve_size = page_size() * page_count;
 
-    // Uncommit and check
-    unsafe { uncommit(base, page_size()) };
-    assert_eq!(unsafe { *base.cast::<u8>().as_ptr() }, 0);
+        for page_offset in 0..page_count {
+            // Allocate and check
+            let base = reserve(reserve_size).unwrap();
+            let page =
+                NonNull::new(unsafe { base.as_ptr().add(page_size() * page_offset) }).unwrap();
 
-    // Unreserve
-    unsafe { unreserve(base, reserve_size) };
+            assert_eq!(unsafe { *page.cast::<u8>().as_ptr() }, 0);
+
+            for _ in 0..10 {
+                // Commit and check
+                unsafe { commit(page, page_size()) }.unwrap();
+                unsafe { *page.cast::<u8>().as_ptr() = 4 };
+                assert_eq!(unsafe { *page.cast::<u8>().as_ptr() }, 4);
+
+                // Uncommit and check
+                unsafe { uncommit(page, page_size()) };
+                assert_eq!(unsafe { *page.cast::<u8>().as_ptr() }, 0);
+            }
+
+            // Unreserve
+            unsafe { unreserve(base, reserve_size) };
+        }
+    }
 }
 
 fn peak_memory_usage() -> usize {

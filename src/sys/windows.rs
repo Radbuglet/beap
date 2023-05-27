@@ -42,6 +42,8 @@ use windows_sys::{
 
 use crate::page_size;
 
+const NULL_HANDLE: HANDLE = 0;
+
 #[derive(Clone)]
 pub struct SystemError(u32);
 
@@ -118,15 +120,15 @@ pub fn page_size_u32() -> u32 {
             sys_info.assume_init()
         };
 
-        // N.B. according to MaulingMonkey:
+        // N.B. `dwPageSize` is, indeed, the right choice here.
         //
-        // • Starting page address would be rounded down to an address that's a multiple of
-        //   dwAllocationGranularity
-        // • Ending page address or page count would be rounded up to an address that's a multiple
-        //   of dwPageSize
+        // - `dwAllocationGranularity` is the granularity at which regions of memory are reserved.
+        // - `dwPageSize` is the granularity at which we can change the pages' protections and their
+        //   mappings.
         //
-        // Since we're using `page_size` to determine the granularity of our reservation lengths,
-        // commits, and uncommits, this is the number we are looking for.
+        // We know that `dwAllocationGranularity >= dwPageSize` so it doesn't really matter how much
+        // our reservations are aligned, just so long as we can begin subdividing them into
+        // committable pages.
         size = sys_info.dwPageSize as u32;
         PAGE_SIZE.store(size, Ordering::Relaxed);
     }
@@ -134,6 +136,8 @@ pub fn page_size_u32() -> u32 {
 }
 
 lazy_static! {
+    // This is the mapping used by all reserved-but-not-committed pages. Because this mapping is
+    // shared amongst all of them, we only have to pay the commit charge overhead once.
     static ref NULL_MAP: HANDLE = unsafe {
         CreateFileMappingW(
             /* file */ INVALID_HANDLE_VALUE,
@@ -148,6 +152,8 @@ lazy_static! {
 
 // TODO: Implement cleanup on failure.
 
+// TODO: Code-review because win32 is just super confusing.
+
 pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
     let page_size = page_size();
     let page_count = alloc_size / page_size;
@@ -159,14 +165,23 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
         "Reservation overflows isize::MAX",
     );
 
-    // Reserve a contiguous block of pages.
+    // Reserve a contiguous block of pages. This allocation is currently one big placeholder which
+    // cannot be written to or read from.
     let Some(base_addr) = NonNull::new(unsafe {
 		VirtualAlloc2(
-			/* process */ INVALID_HANDLE_VALUE,
+			/* process */ 
+			// N.B. For `VirtualAlloc2`, a `NULL` process handle—not `INVALID_HANDLE_VALUE`—corresponds
+			// to allocating memory for the calling process.
+			NULL_HANDLE,
+
 			/* base address */ null(),
 			/* size */ alloc_size,
+
+			// N.B. This flag combination, although a bit weird, is the only officially valid flag
+			// combination producing a usable placeholder page.
 			/* flags */ MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
 			/* protection */ PAGE_NOACCESS,
+
 			/* ExtendedParameters + Count */ null_mut(), 0
 		)
 	}) else {
@@ -182,11 +197,27 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
     for i in 0..page_count {
         let addr = unsafe { addr.as_ptr().add(i * page_size) };
 
-        // Isolate a placeholder for the page if it isn't already of that size.
+        // Isolate a placeholder for the page if there isn't already a placeholder of that size at
+		// that location.
         if i != page_count - 1 {
             if unsafe {
                 VirtualFree(
                     /* base address */ addr.cast(),
+
+					// N.B. The flag combination `MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER` is blessed
+					// as being the official way to split a placeholder into two placeholders.
+					//
+					// The following documentation on MSDN may make you worry that this call is invalid:
+					//
+					// > If you specify this value [`MEM_RELEASE`], *dwSize* must be 0 (zero), and
+					// > *lpAddress* must point to the base address returned by the *VirtualAlloc*
+					// > function when the region is reserved. The function fails if either of these
+					// > conditions is not met.
+					//
+					// This documentation, however, is misleading. When they say "specify this value,"
+					// they mean "you passed `MEM_RELEASE` verbatim," not "you toggled this flag on."
+					//
+					// Anyways, win32 is kinda scuffed.
                     /* size */ page_size,
                     /* flags */ MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
                 )
@@ -198,17 +229,17 @@ pub fn reserve(alloc_size: usize) -> Result<NonNull<()>, SystemError> {
 
         // ...and map it!
         let mapped_addr = unsafe {
+			// N.B. The page size is always greater than 64 bytes, as far as I can tell, so the whole
+			// "64k-aligned" stuff should not matter.
             MapViewOfFile3(
                 /* map */ null_map,
                 /* process */ INVALID_HANDLE_VALUE,
                 /* base address */ addr.cast(),
                 /* size high */ 0,
                 /* size low */ page_size,
-                /* flags */ MEM_REPLACE_PLACEHOLDER,
+				/* flags */ MEM_REPLACE_PLACEHOLDER,
                 /* protection */ PAGE_READONLY,
-                /* extra params */
-                null_mut(),
-                0,
+                /* extra params */ null_mut(), 0,
             )
         };
 
@@ -256,16 +287,14 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
         }
 
         // ...and commit the placeholder's memory.
-        // FIXME: This just doesn't work.
         if unsafe {
             VirtualAlloc2(
                 /* process */ INVALID_HANDLE_VALUE,
-                /* base address */ null(),
+                /* base address */ addr.cast(),
                 /* size */ page_size,
-                /* flags */ MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                /* flags */ MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
                 /* protection */ PAGE_READWRITE,
-                /* ExtendedParameters + Count */ null_mut(),
-                0,
+                /* ExtendedParameters + Count */ null_mut(), 0,
             )
         }
         .is_null()
@@ -295,9 +324,9 @@ pub unsafe fn uncommit(addr: NonNull<()>, size: usize) {
         // Decommit its memory...
         if unsafe {
             VirtualFree(
-                addr.cast(),
-                page_size,
-                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                /* base address */ addr.cast(),
+                /* size */ 0,
+                /* flags */ MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
             )
         } != 0
         {
@@ -314,9 +343,7 @@ pub unsafe fn uncommit(addr: NonNull<()>, size: usize) {
                 /* size low */ page_size,
                 /* flags */ MEM_REPLACE_PLACEHOLDER,
                 /* protection */ PAGE_READONLY,
-                /* extra params */
-                null_mut(),
-                0,
+                /* extra params */ null_mut(), 0,
             )
         } == 0
         {
