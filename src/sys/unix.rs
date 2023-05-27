@@ -82,10 +82,13 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
         // N.B. `MAP_FIXED` is allowed to discard underlying mappings.
         //
         // According to `mmap(2)` (https://web.archive.org/web/20230512013353/https://man7.org/linux/man-pages/man2/mmap.2.html):
+        //
+        // ```
         // If the memory region specified by addr and length overlaps pages of any
         // existing mapping(s), then the overlapped part of the existing mapping(s)
         // will be discarded.  If the specified address cannot be used, mmap()
         // will fail.
+        // ```
         //
         libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
         -1,

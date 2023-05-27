@@ -31,8 +31,9 @@ use windows_sys::{
             },
             Memory::{
                 CreateFileMappingW, LocalFree, MapViewOfFile3, UnmapViewOfFile2, VirtualAlloc2,
-                VirtualFree, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-                MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+                VirtualFree, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+                MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+                PAGE_READONLY, PAGE_READWRITE,
             },
             SystemInformation::{GetSystemInfo, SYSTEM_INFO},
         },
@@ -261,7 +262,7 @@ pub unsafe fn commit(addr: NonNull<()>, size: usize) -> Result<(), SystemError> 
                 /* process */ INVALID_HANDLE_VALUE,
                 /* base address */ null(),
                 /* size */ page_size,
-                /* flags */ MEM_REPLACE_PLACEHOLDER,
+                /* flags */ MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
                 /* protection */ PAGE_READWRITE,
                 /* ExtendedParameters + Count */ null_mut(),
                 0,
@@ -293,12 +294,12 @@ pub unsafe fn uncommit(addr: NonNull<()>, size: usize) {
 
         // Decommit its memory...
         if unsafe {
-            UnmapViewOfFile2(
-                /* process*/ INVALID_HANDLE_VALUE,
-                /* base address */ addr as isize,
-                /* flags */ MEM_PRESERVE_PLACEHOLDER,
+            VirtualFree(
+                addr.cast(),
+                page_size,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
             )
-        } != 1
+        } != 0
         {
             SystemError::from_errno().raise();
         }

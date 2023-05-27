@@ -23,8 +23,30 @@
 //! Regions are described at page-level granularity, whose size varies between operating systems. This
 //! value can be queried at runtime through [`page_size`].
 
-cfg_if::cfg_if! {
-    if #[cfg(any(windows, unix))] {
+#[cfg(any(windows, unix))]
+#[macro_export]
+macro_rules! is_supported {
+    (
+		$(true => { $($true:tt)* })?
+		$(false => { $($false:tt)* })?
+	) => {
+		$($($true)*)?
+	};
+}
+
+#[cfg(not(any(windows, unix)))]
+#[macro_export]
+macro_rules! is_supported {
+    (
+		$(true => { $($true:tt)* })?
+		$(false => { $($false:tt)* })?
+	) => {
+		$($($false)*)?
+	};
+}
+
+is_supported! {
+    true => {
         // === Platform Specific === //
 
         #[cfg(windows)]

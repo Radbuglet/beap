@@ -70,26 +70,28 @@ fn commit_and_write() {
 }
 
 fn peak_memory_usage() -> usize {
-    cfg_if::cfg_if! {
-        if #[cfg(windows)] {
-            use windows_sys::Win32::System::ProcessStatus::{
-                GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-            };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
 
-            let stats = unsafe {
-                let mut counters = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
-                GetProcessMemoryInfo(
-                    0,
-                    counters.as_mut_ptr(),
-                    std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-                );
-                counters.assume_init()
-            };
+        let stats = unsafe {
+            let mut counters = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
+            GetProcessMemoryInfo(
+                0,
+                counters.as_mut_ptr(),
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            );
+            counters.assume_init()
+        };
 
-            stats.PeakPagefileUsage
-        } else {
-            // TODO: Add support for Darwin and Linux
-            0
-        }
+        stats.PeakPagefileUsage
+    }
+
+    #[cfg(not(windows))]
+    {
+        // TODO: Add support for Darwin and Linux
+        0
     }
 }
