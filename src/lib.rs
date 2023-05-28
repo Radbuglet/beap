@@ -49,38 +49,18 @@
 //  privileges or a sufficiently high windows version. We may also want a feature to disable the
 //  crate entirely.
 
-#[cfg(any(windows, unix))]
-#[macro_export]
-macro_rules! is_supported {
-    (
-		$(true => { $($true:tt)* })?
-		$(false => { $($false:tt)* })?
-	) => {
-		$($($true)*)?
-	};
-}
+// === Platform-specific === //
 
-#[cfg(not(any(windows, unix)))]
-#[macro_export]
-macro_rules! is_supported {
-    (
-		$(true => { $($true:tt)* })?
-		$(false => { $($false:tt)* })?
-	) => {
-		$($($false)*)?
-	};
-}
+cfgenius::cond! {
+    if cfg(windows) {
+        cfgenius::define!(pub is_supported = true());
 
-is_supported! {
-    true => {
-        // === Platform Specific === //
-
-        #[cfg(windows)]
         #[path = "sys/windows.rs"]
         mod windows;
 
-        #[cfg(windows)]
         pub use windows::*;
+    } else if cfg(unix) {
+        cfgenius::define!(pub is_supported = true());
 
         #[cfg(unix)]
         #[path = "sys/unix.rs"]
@@ -88,9 +68,17 @@ is_supported! {
 
         #[cfg(unix)]
         pub use unix::*;
+    } else {
+        cfgenius::define!(pub is_supported = false());
+    }
+}
 
-        // === Platform Agnostic === //
+// === Platform Agnostic === //
 
+pub const IS_SUPPORTED: bool = cfgenius::cond_expr!(macro(is_supported));
+
+cfgenius::cond! {
+    if macro(is_supported) {
         pub fn round_up_to_page_size(size: usize) -> usize {
             let page_size = page_size();
 
@@ -100,8 +88,6 @@ is_supported! {
         pub fn page_size() -> usize {
             page_size_u32() as usize
         }
-
-        // === Tests === //
 
         #[cfg(test)]
         mod tests;
